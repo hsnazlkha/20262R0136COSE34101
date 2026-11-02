@@ -12,6 +12,9 @@ struct {
   struct proc proc[NPROC];
 } ptable;
 
+static struct proc *ready_queue[NPROC];
+static int ready_count = 0;
+
 static struct proc *initproc;
 
 int nextpid = 1;
@@ -19,6 +22,72 @@ extern void forkret(void);
 extern void trapret(void);
 
 static void wakeup1(void *chan);
+
+static void 
+enqueue(struct proc *p)
+{
+  int i;
+
+  for(i = 0; i < ready_count; i++){
+    if(ready_queue[i] == p)
+      return;
+  }
+
+  if(ready_count >= NPROC)
+    panic("ready queue full");
+
+  i = ready_count;
+
+  while(i > 0 &&
+        (ready_queue[i-1]->priority > p->priority ||
+        (ready_queue[i-1]->priority == p->priority &&
+         ready_queue[i-1]->pid < p->pid))){
+    ready_queue[i] = ready_queue[i-1];
+    i--;
+  }
+
+  ready_queue[i] = p;
+  ready_count++;
+}
+
+static int
+remove_from_queue(struct proc *p)
+{
+  int i, j;
+
+  for(i = 0; i < ready_count; i++){
+    if(ready_queue[i] == p){
+      for(j = i; j < ready_count - 1; j++)
+        ready_queue[j] = ready_queue[j+1];
+
+      ready_count--;
+      ready_queue[ready_count] = 0;
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static struct proc*
+dequeue(void)
+{
+  struct proc *p;
+  int i;
+
+  if(ready_count == 0)
+    return 0;
+
+  p = ready_queue[0];
+
+  for(i = 0; i < ready_count - 1; i++)
+    ready_queue[i] = ready_queue[i+1];
+
+  ready_count--;
+  ready_queue[ready_count] = 0;
+
+  return p;
+}
 
 void
 pinit(void)
@@ -152,6 +221,8 @@ userinit(void)
 
   p->state = RUNNABLE;
 
+  enqueue(p);
+
   release(&ptable.lock);
 }
 
@@ -224,6 +295,8 @@ fork(void)
   acquire(&ptable.lock);
 
   np->state = RUNNABLE;
+
+  enqueue(np);
 
   release(&ptable.lock);
 
@@ -341,13 +414,11 @@ scheduler(void)
 
     // Loop over process table looking for process to run.
     acquire(&ptable.lock);
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != RUNNABLE)
-        continue;
 
-      // Switch to chosen process.  It is the process's job
-      // to release ptable.lock and then reacquire it
-      // before jumping back to us.
+    p = dequeue();  //Get the highest-priority runnable process
+
+    if(p != 0){
+      // Mark the process as running
       c->proc = p;
       switchuvm(p);
       p->state = RUNNING;
@@ -396,6 +467,7 @@ yield(void)
 {
   acquire(&ptable.lock);  //DOC: yieldlock
   myproc()->state = RUNNABLE;
+  enqueue(myproc());
   sched();
   release(&ptable.lock);
 }
@@ -469,8 +541,10 @@ wakeup1(void *chan)
   struct proc *p;
 
   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
-    if(p->state == SLEEPING && p->chan == chan)
+    if(p->state == SLEEPING && p->chan == chan){
       p->state = RUNNABLE;
+      enqueue(p);
+    }
 }
 
 // Wake up all processes sleeping on chan.
@@ -495,8 +569,10 @@ kill(int pid)
     if(p->pid == pid){
       p->killed = 1;
       // Wake process from sleep if necessary.
-      if(p->state == SLEEPING)
+      if(p->state == SLEEPING){
         p->state = RUNNABLE;
+        enqueue(p);
+      }
       release(&ptable.lock);
       return 0;
     }
@@ -552,7 +628,15 @@ setnice(int pid, int nice)
   acquire(&ptable.lock);
   for( p = ptable.proc; p < &ptable.proc[NPROC]; p++){
     if(p->pid==pid){
+
+      if(p->state == RUNNABLE)
+        remove_from_queue(p);
+
       p->priority = nice;
+
+      if(p->state == RUNNABLE)
+        enqueue(p);
+
       release(&ptable.lock);
       return 0;
     }
