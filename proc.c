@@ -254,6 +254,7 @@ int
 fork(void)
 {
   int i, pid;
+  int should_yield = 0;
   struct proc *np;
   struct proc *curproc = myproc();
 
@@ -298,7 +299,17 @@ fork(void)
 
   enqueue(np);
 
+  if(ready_count > 0 &&
+     (ready_queue[0]->priority < curproc->priority ||
+     (ready_queue[0]->priority == curproc->priority &&
+      ready_queue[0]->pid > curproc->pid))){
+    should_yield = 1;
+  }
+
   release(&ptable.lock);
+
+  if(should_yield)
+    yield();
 
   return pid;
 }
@@ -621,11 +632,28 @@ procdump(void)
 int
 setnice(int pid, int nice)
 {
+  struct proc *p;
+  struct proc *cur;
+  struct proc *next;
+  int was_ready_better = 0;
+  int is_ready_better = 0;
+  int should_yield = 0;
+  
   if( nice < 0 || nice > 30)
     return -1;
 
-  struct proc *p;
   acquire(&ptable.lock);
+
+  cur = myproc();
+
+  if(cur != 0 && cur->state == RUNNING && ready_count > 0){
+    next = ready_queue[0];
+
+    if(next->priority < cur->priority ||
+       (next->priority == cur->priority && next->pid > cur->pid))
+      was_ready_better = 1;
+  }
+
   for( p = ptable.proc; p < &ptable.proc[NPROC]; p++){
     if(p->pid==pid){
 
@@ -637,7 +665,22 @@ setnice(int pid, int nice)
       if(p->state == RUNNABLE)
         enqueue(p);
 
+      if(cur != 0 && cur->state == RUNNING && ready_count > 0){
+        next = ready_queue[0];
+
+        if(next->priority < cur->priority ||
+           (next->priority == cur->priority && next->pid > cur->pid))
+          is_ready_better = 1;
+      }
+
+      if(!was_ready_better && is_ready_better)
+        should_yield = 1;
+
       release(&ptable.lock);
+
+      if(should_yield)
+        yield();
+
       return 0;
     }
   }
