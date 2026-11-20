@@ -46,8 +46,6 @@ kinit2(void *vstart, void *vend)
 {
   freerange(vstart, vend);
   kmem.use_lock = 1;
-  memset(&pmem.refcount, 0, sizeof(uint) * (PHYSTOP >> PGSHIFT));
-  pmem.num_free_pages = 0;
 }
 
 void
@@ -67,9 +65,20 @@ void
 kfree(char *v)
 {
   struct run *r;
+  uint pa;
 
   if((uint)v % PGSIZE || v < end || V2P(v) >= PHYSTOP)
     panic("kfree");
+
+  pa = V2P(v);
+
+  if(get_refcount(pa) > 1) {
+    dec_refcount(pa);
+    return;
+  } 
+
+  if(get_refcount(pa) == 1)
+    dec_refcount(pa);
 
   // Fill with junk to catch dangling refs.
   memset(v, 1, PGSIZE);
@@ -97,10 +106,11 @@ kalloc(void)
   if(kmem.use_lock)
     acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r){
     kmem.freelist = r->next;
-
-  pmem.num_free_pages--;
+    pmem.num_free_pages--;
+    inc_refcount(V2P((char*)r));
+  }
 
   if(kmem.use_lock)
     release(&kmem.lock);
@@ -116,17 +126,17 @@ freemem(void)
 uint
 get_refcount(uint pa)
 {
-  return 0;
+  return pmem.refcount[pa >> PGSHIFT];
 }
 
 void
 inc_refcount(uint pa)
 {
-  return;
+  pmem.refcount[pa >> PGSHIFT]++;
 }
 
 void  
 dec_refcount(uint pa)
 {
-  return;
+  pmem.refcount[pa >> PGSHIFT]--;
 }
