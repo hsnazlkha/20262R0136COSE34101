@@ -327,10 +327,13 @@ copyuvm(pde_t *pgdir, uint sz)
     if(!(*pte & PTE_P))
       panic("copyuvm: page not present");
     pa = PTE_ADDR(*pte);
-    flags = PTE_FLAGS(*pte);
     
-    flags &= ~PTE_W;
-    *pte = pa | flags;
+    flags = PTE_FLAGS(*pte);
+
+    if(flags & PTE_W){
+      flags = (flags & ~PTE_W) | PTE_COW;
+      *pte = pa | flags;
+    }
 
     if(mappages(d, (void*)i, PGSIZE, pa, flags) < 0)
       goto bad;
@@ -365,39 +368,125 @@ uva2ka(pde_t *pgdir, char *uva)
 // Copy len bytes from p to user address va in page table pgdir.
 // Most useful when pgdir is not the current page table.
 // uva2ka ensures this only works for PTE_U pages.
+
 int
 copyout(pde_t *pgdir, uint va, void *p, uint len)
 {
-  char *buf, *pa0;
-  uint n, va0;
+  char *buf, *pa0, *mem;
+  uint n, va0, pa, flags;
+  pte_t *pte;
+  int refcount;
 
   buf = (char*)p;
+
   while(len > 0){
     va0 = (uint)PGROUNDDOWN(va);
+
+    pte = walkpgdir(pgdir, (char*)va0, 0);
+
+    if(pte && (*pte & PTE_P) && (*pte & PTE_COW)){
+      pa = PTE_ADDR(*pte);
+      flags = PTE_FLAGS(*pte);
+      refcount = get_refcount(pa);
+
+      if(refcount > 1){
+        if((mem = kalloc()) == 0)
+          return -1;
+
+        memmove(mem, (char*)P2V(pa), PGSIZE);
+        dec_refcount(pa);
+
+        *pte = V2P(mem) | ((flags & ~PTE_COW) | PTE_W);
+      }
+      else if(refcount == 1){
+        *pte = pa | ((flags & ~PTE_COW) | PTE_W);
+      }
+      else{
+        return -1;
+      }
+
+      if(myproc() && myproc()->pgdir == pgdir)
+        lcr3(V2P(pgdir));
+    }
+
     pa0 = uva2ka(pgdir, (char*)va0);
     if(pa0 == 0)
       return -1;
+
     n = PGSIZE - (va - va0);
     if(n > len)
       n = len;
+
     memmove(pa0 + (va - va0), buf, n);
+
     len -= n;
     buf += n;
     va = va0 + PGSIZE;
   }
+
   return 0;
 }
 
 void
-page_fault(void)
+page_fault(struct trapframe *tf)
 {
-  uint va = rcr2();
-  if(va < 0) {
-    panic("Invalid access");
+  uint va;
+  pte_t *pte;
+  uint pa;
+  char *mem;
+  int refcount;
+  uint flags;
+
+  va = rcr2();
+
+  if(myproc() == 0)
+    panic("page fault without process");
+
+  if((tf->err & 0x3) != 0x3)
+    goto bad;
+
+  if(va >= myproc()->sz)
+    goto bad;
+
+  pte = walkpgdir(myproc()->pgdir, (char*)va, 0);
+
+  if(pte == 0 || !(*pte & PTE_P))
+    goto bad;
+
+  if(!(*pte & PTE_COW))
+    goto bad;
+
+  pa = PTE_ADDR(*pte);
+  refcount = get_refcount(pa);
+  flags = PTE_FLAGS(*pte);
+
+  if(refcount > 1){
+    if((mem = kalloc()) == 0)
+      goto bad;
+
+    memmove(mem, (char*)P2V(pa), PGSIZE);
+
+    dec_refcount(pa);
+
+    *pte = V2P(mem) | ((flags & ~PTE_COW) | PTE_W);
+  }
+  else if(refcount == 1){
+    *pte = pa | ((flags & ~PTE_COW) | PTE_W);
+  }
+  else{
+    goto bad;
+  }
+
+  lcr3(V2P(myproc()->pgdir));
+  return;
+
+bad:
+  if((tf->cs & 3) == DPL_USER){
+    myproc()->killed = 1;
     return;
   }
-  
-  return;
+
+  panic("Invalid kernel page fault");
 }
 
 //PAGEBREAK!
